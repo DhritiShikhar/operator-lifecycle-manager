@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -217,10 +218,12 @@ func (c *CatalogSource) Poll() bool {
 	if c.Spec.UpdateStrategy == nil {
 		return false
 	}
+
 	// if polling interval is zero polling will not be done
 	if c.Spec.UpdateStrategy.RegistryPoll == nil {
 		return false
 	}
+
 	// if catalog source is not backed by an image polling will not be done
 	if c.Spec.Image == "" {
 		return false
@@ -230,6 +233,28 @@ func (c *CatalogSource) Poll() bool {
 		return false
 	}
 	return true
+}
+
+// UnmarshalJSON implements the encoding/json.Unmarshaler interface.
+func (u *UpdateStrategy) UnmarshalJSON(data []byte) (err error) {
+	var updateStrategyMap map[string]map[string]string
+	if err = json.Unmarshal(data, &updateStrategyMap); err != nil {
+		return err
+	}
+
+	registryPoll := &RegistryPoll{}
+	duration, err := time.ParseDuration(updateStrategyMap["registryPoll"]["interval"])
+	if err != nil {
+		defaultTime, err := time.ParseDuration("15m")
+		if err != nil {
+			return err
+		}
+		registryPoll.Interval = &metav1.Duration{Duration: defaultTime}
+	} else {
+		registryPoll.Interval = &metav1.Duration{Duration: duration}
+	}
+	u.RegistryPoll = registryPoll
+	return nil
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
