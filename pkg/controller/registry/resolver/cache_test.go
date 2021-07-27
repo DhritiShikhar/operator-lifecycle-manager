@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -35,6 +37,8 @@ func (s *BundleStreamStub) Recv() (*api.Bundle, error) {
 
 type RegistryClientStub struct {
 	BundleIterator *client.BundleIterator
+
+	ListBundlesError error
 }
 
 func (s *RegistryClientStub) Get() (client.Interface, error) {
@@ -58,7 +62,7 @@ func (s *RegistryClientStub) GetBundleThatProvides(ctx context.Context, group, v
 }
 
 func (s *RegistryClientStub) ListBundles(ctx context.Context) (*client.BundleIterator, error) {
-	return s.BundleIterator, nil
+	return s.BundleIterator, s.ListBundlesError
 }
 
 func (s *RegistryClientStub) GetPackage(ctx context.Context, packageName string) (*api.Package, error) {
@@ -123,7 +127,7 @@ func TestOperatorCacheConcurrency(t *testing.T) {
 			nc := c.Namespaced(namespaces...)
 			for _, index := range indices {
 				name := fmt.Sprintf("%s/%s", keys[index].Namespace, keys[index].Name)
-				operators := nc.Find(WithCSVName(name))
+				operators := nc.Find(CSVNamePredicate(name))
 				if len(operators) != 1 {
 					return fmt.Errorf("expected 1 operator, got %d", len(operators))
 				}
@@ -159,7 +163,7 @@ func TestOperatorCacheExpiration(t *testing.T) {
 	c := NewOperatorCache(rcp, logrus.New(), catsrcLister)
 	c.ttl = 0 // instantly stale
 
-	require.Len(t, c.Namespaced("dummynamespace").Catalog(key).Find(WithCSVName("csvname")), 1)
+	require.Len(t, c.Namespaced("dummynamespace").Catalog(key).Find(CSVNamePredicate("csvname")), 1)
 }
 
 func TestOperatorCacheReuse(t *testing.T) {
@@ -182,7 +186,7 @@ func TestOperatorCacheReuse(t *testing.T) {
 
 	c := NewOperatorCache(rcp, logrus.New(), catsrcLister)
 
-	require.Len(t, c.Namespaced("dummynamespace").Catalog(key).Find(WithCSVName("csvname")), 1)
+	require.Len(t, c.Namespaced("dummynamespace").Catalog(key).Find(CSVNamePredicate("csvname")), 1)
 }
 
 func TestCatalogSnapshotExpired(t *testing.T) {
@@ -232,7 +236,7 @@ func TestCatalogSnapshotFind(t *testing.T) {
 	for _, tt := range []tc{
 		{
 			Name: "nothing satisfies predicate",
-			Predicate: OperatorPredicateFunc(func(*Operator) bool {
+			Predicate: OperatorPredicateTestFunc(func(*Operator) bool {
 				return false
 			}),
 			Operators: []*Operator{
@@ -244,7 +248,7 @@ func TestCatalogSnapshotFind(t *testing.T) {
 		},
 		{
 			Name: "no operators in snapshot",
-			Predicate: OperatorPredicateFunc(func(*Operator) bool {
+			Predicate: OperatorPredicateTestFunc(func(*Operator) bool {
 				return true
 			}),
 			Operators: nil,
@@ -252,7 +256,7 @@ func TestCatalogSnapshotFind(t *testing.T) {
 		},
 		{
 			Name: "everything satisfies predicate",
-			Predicate: OperatorPredicateFunc(func(*Operator) bool {
+			Predicate: OperatorPredicateTestFunc(func(*Operator) bool {
 				return true
 			}),
 			Operators: []*Operator{
@@ -268,7 +272,7 @@ func TestCatalogSnapshotFind(t *testing.T) {
 		},
 		{
 			Name: "some satisfy predicate",
-			Predicate: OperatorPredicateFunc(func(o *Operator) bool {
+			Predicate: OperatorPredicateTestFunc(func(o *Operator) bool {
 				return o.name != "a"
 			}),
 			Operators: []*Operator{
@@ -333,55 +337,27 @@ func TestStripPluralRequiredAndProvidedAPIKeys(t *testing.T) {
 	c := NewOperatorCache(rcp, logrus.New(), catsrcLister)
 
 	nc := c.Namespaced("testnamespace")
-	result, err := AtLeast(1, nc.Find(ProvidingAPI(opregistry.APIKey{Group: "g", Version: "v1", Kind: "K"})))
+	result, err := AtLeast(1, nc.Find(ProvidingAPIPredicate(opregistry.APIKey{Group: "g", Version: "v1", Kind: "K"})))
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(result))
 	assert.Equal(t, "K.v1.g", result[0].providedAPIs.String())
 	assert.Equal(t, "K2.v2.g2", result[0].requiredAPIs.String())
 }
 
-func TestCountingPredicate(t *testing.T) {
-	for _, tc := range []struct {
-		Name        string
-		TestResults []bool
-		Expected    int
-	}{
-		{
-			Name:        "no increment on failure",
-			TestResults: []bool{false},
-			Expected:    0,
-		},
-		{
-			Name:        "increment on success",
-			TestResults: []bool{true},
-			Expected:    1,
-		},
-		{
-			Name:        "multiple increments",
-			TestResults: []bool{true, true},
-			Expected:    2,
-		},
-		{
-			Name:        "no increment without test",
-			TestResults: nil,
-			Expected:    0,
-		},
-	} {
-		t.Run(tc.Name, func(t *testing.T) {
-			var (
-				n      int
-				result bool
-			)
+func TestNamespaceOperatorCacheError(t *testing.T) {
+	rcp := RegistryClientProviderStub{}
+	catsrcLister := operatorlister.NewLister().OperatorsV1alpha1().CatalogSourceLister()
+	key := registry.CatalogKey{Namespace: "dummynamespace", Name: "dummyname"}
+	rcp[key] = &RegistryClientStub{
+		ListBundlesError: errors.New("testing"),
+	}
 
-			p := CountingPredicate(OperatorPredicateFunc(func(*Operator) bool {
-				return result
-			}), &n)
-
-			for _, result = range tc.TestResults {
-				p.Test(nil)
-			}
-
-			assert.Equal(t, tc.Expected, n)
-		})
+	logger, _ := test.NewNullLogger()
+	c := NewOperatorCache(rcp, logger, catsrcLister)
+	require.EqualError(t, c.Namespaced("dummynamespace").Error(), "error using catalog dummyname (in namespace dummynamespace): testing")
+	if snapshot, ok := c.snapshots[key]; !ok {
+		t.Fatalf("cache snapshot not found")
+	} else {
+		require.Zero(t, snapshot.expiry)
 	}
 }

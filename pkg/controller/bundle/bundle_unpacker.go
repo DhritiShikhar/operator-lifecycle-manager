@@ -9,6 +9,7 @@ import (
 
 	"github.com/operator-framework/operator-registry/pkg/api"
 	"github.com/operator-framework/operator-registry/pkg/configmap"
+	"github.com/sirupsen/logrus"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -25,6 +26,7 @@ import (
 	"github.com/operator-framework/api/pkg/operators/reference"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	listersoperatorsv1alpha1 "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/resolver/projection"
 )
 
@@ -39,6 +41,7 @@ const (
 	// The time duration should be in the same format as accepted by time.ParseDuration()
 	// e.g 1m30s
 	BundleUnpackTimeoutAnnotationKey = "operatorframework.io/bundle-unpack-timeout"
+	BundleUnpackPodLabel             = "job-name"
 )
 
 type BundleUnpackResult struct {
@@ -100,9 +103,14 @@ func (c *ConfigMapUnpacker) job(cmRef *corev1.ObjectReference, bundlePath string
 					ImagePullSecrets: secrets,
 					Containers: []corev1.Container{
 						{
-							Name:    "extract",
-							Image:   c.opmImage,
-							Command: []string{"opm", "alpha", "bundle", "extract", "-m", "/bundle/", "-n", cmRef.Namespace, "-c", cmRef.Name},
+							Name:  "extract",
+							Image: c.opmImage,
+							Command: []string{"opm", "alpha", "bundle", "extract",
+								"-m", "/bundle/",
+								"-n", cmRef.Namespace,
+								"-c", cmRef.Name,
+								"-z",
+							},
 							Env: []corev1.EnvVar{
 								{
 									Name:  configmap.EnvContainerImage,
@@ -225,6 +233,7 @@ type Unpacker interface {
 }
 
 type ConfigMapUnpacker struct {
+	logger        *logrus.Logger
 	opmImage      string
 	utilImage     string
 	client        kubernetes.Interface
@@ -269,6 +278,12 @@ func WithOPMImage(opmImage string) ConfigMapUnpackerOption {
 func WithUtilImage(utilImage string) ConfigMapUnpackerOption {
 	return func(unpacker *ConfigMapUnpacker) {
 		unpacker.utilImage = utilImage
+	}
+}
+
+func WithLogger(logger *logrus.Logger) ConfigMapUnpackerOption {
+	return func(unpacker *ConfigMapUnpacker) {
+		unpacker.logger = logger
 	}
 }
 
@@ -505,9 +520,10 @@ func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup,
 func (c *ConfigMapUnpacker) pendingContainerStatusMessages(job *batchv1.Job) (string, error) {
 	containerStatusMessages := []string{}
 	// List pods for unpack job
-	podLabel := map[string]string{"job-name": job.GetName()}
-	pods, listErr := c.podLister.Pods(job.GetNamespace()).List(k8slabels.SelectorFromSet(podLabel))
+	podLabel := map[string]string{BundleUnpackPodLabel: job.GetName()}
+	pods, listErr := c.podLister.Pods(job.GetNamespace()).List(k8slabels.SelectorFromValidatedSet(podLabel))
 	if listErr != nil {
+		c.logger.Errorf("Failed to list pods for job(%s): %v", job.GetName(), listErr)
 		return "", fmt.Errorf("Failed to list pods for job(%s): %v", job.GetName(), listErr)
 	}
 
@@ -545,10 +561,25 @@ func (c *ConfigMapUnpacker) ensureConfigmap(csRef *corev1.ObjectReference, name 
 	fresh.SetNamespace(csRef.Namespace)
 	fresh.SetName(name)
 	fresh.SetOwnerReferences([]metav1.OwnerReference{ownerRef(csRef)})
+	fresh.SetLabels(map[string]string{install.OLMManagedLabelKey: install.OLMManagedLabelValue})
 
 	cm, err = c.cmLister.ConfigMaps(fresh.GetNamespace()).Get(fresh.GetName())
 	if apierrors.IsNotFound(err) {
 		cm, err = c.client.CoreV1().ConfigMaps(fresh.GetNamespace()).Create(context.TODO(), fresh, metav1.CreateOptions{})
+		// CM already exists in cluster but not in cache, then add the label
+		if err != nil && apierrors.IsAlreadyExists(err) {
+			cm, err = c.client.CoreV1().ConfigMaps(fresh.GetNamespace()).Get(context.TODO(), fresh.GetName(), metav1.GetOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("Failed to retrieve configmap %s: %v", fresh.GetName(), err)
+			}
+			cm.SetLabels(map[string]string{
+				install.OLMManagedLabelKey: install.OLMManagedLabelValue,
+			})
+			cm, err = c.client.CoreV1().ConfigMaps(cm.GetNamespace()).Update(context.TODO(), cm, metav1.UpdateOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("Failed to update configmap %s: %v", cm.GetName(), err)
+			}
+		}
 	}
 
 	return

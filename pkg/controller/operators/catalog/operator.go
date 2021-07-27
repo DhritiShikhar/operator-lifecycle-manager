@@ -21,11 +21,13 @@ import (
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	extinf "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
 	utilclock "k8s.io/apimachinery/pkg/util/clock"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -43,9 +45,12 @@ import (
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions"
+	operatorsv1alpha1listers "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/bundle"
 	olmerrors "github.com/operator-framework/operator-lifecycle-manager/pkg/controller/errors"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/catalog/subscription"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/internal/pruning"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/grpc"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/reconciler"
@@ -102,7 +107,6 @@ type Operator struct {
 	sourcesLastUpdate        sharedtime.SharedTime
 	resolver                 resolver.StepResolver
 	reconciler               reconciler.RegistryReconcilerFactory
-	csvProvidedAPIsIndexer   map[string]cache.Indexer
 	catalogSubscriberIndexer map[string]cache.Indexer
 	clientAttenuator         *scoped.ClientAttenuator
 	serviceAccountQuerier    *scoped.UserDefinedServiceAccountQuerier
@@ -115,7 +119,7 @@ type Operator struct {
 type CatalogSourceSyncFunc func(logger *logrus.Entry, in *v1alpha1.CatalogSource) (out *v1alpha1.CatalogSource, continueSync bool, syncError error)
 
 // NewOperator creates a new Catalog Operator.
-func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clock, logger *logrus.Logger, resync time.Duration, configmapRegistryImage, utilImage string, operatorNamespace string, scheme *runtime.Scheme, installPlanTimeout time.Duration, bundleUnpackTimeout time.Duration) (*Operator, error) {
+func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clock, logger *logrus.Logger, resync time.Duration, configmapRegistryImage, opmImage, utilImage string, operatorNamespace string, scheme *runtime.Scheme, installPlanTimeout time.Duration, bundleUnpackTimeout time.Duration) (*Operator, error) {
 	resyncPeriod := queueinformer.ResyncWithJitter(resync, 0.2)
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	if err != nil {
@@ -173,7 +177,6 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 		catsrcQueueSet:           queueinformer.NewEmptyResourceQueueSet(),
 		subQueueSet:              queueinformer.NewEmptyResourceQueueSet(),
 		ipQueueSet:               queueinformer.NewEmptyResourceQueueSet(),
-		csvProvidedAPIsIndexer:   map[string]cache.Indexer{},
 		catalogSubscriberIndexer: map[string]cache.Indexer{},
 		serviceAccountQuerier:    scoped.NewUserDefinedServiceAccountQuerier(logger, crClient),
 		clientAttenuator:         scoped.NewClientAttenuator(logger, config, opClient),
@@ -189,18 +192,41 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	// Wire OLM CR sharedIndexInformers
 	crInformerFactory := externalversions.NewSharedInformerFactoryWithOptions(op.client, resyncPeriod())
 
-	// Wire CSVs
-	csvInformer := crInformerFactory.Operators().V1alpha1().ClusterServiceVersions()
-	op.lister.OperatorsV1alpha1().RegisterClusterServiceVersionLister(metav1.NamespaceAll, csvInformer.Lister())
-	if err := op.RegisterInformer(csvInformer.Informer()); err != nil {
+	// Fields are pruned from local copies of the objects managed
+	// by this informer in order to reduce cached size.
+	prunedCSVInformer := cache.NewSharedIndexInformer(
+		pruning.NewListerWatcher(op.client, metav1.NamespaceAll, func(*metav1.ListOptions) {}, pruning.PrunerFunc(func(csv *v1alpha1.ClusterServiceVersion) {
+			*csv = v1alpha1.ClusterServiceVersion{
+				TypeMeta: csv.TypeMeta,
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        csv.Name,
+					Namespace:   csv.Namespace,
+					Labels:      csv.Labels,
+					Annotations: csv.Annotations,
+				},
+				Spec: v1alpha1.ClusterServiceVersionSpec{
+					CustomResourceDefinitions: csv.Spec.CustomResourceDefinitions,
+					APIServiceDefinitions:     csv.Spec.APIServiceDefinitions,
+					Replaces:                  csv.Spec.Replaces,
+					Version:                   csv.Spec.Version,
+				},
+				Status: v1alpha1.ClusterServiceVersionStatus{
+					Phase:  csv.Status.Phase,
+					Reason: csv.Status.Reason,
+				},
+			}
+		})),
+		&v1alpha1.ClusterServiceVersion{},
+		resyncPeriod(),
+		cache.Indexers{
+			cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+		},
+	)
+	csvLister := operatorsv1alpha1listers.NewClusterServiceVersionLister(prunedCSVInformer.GetIndexer())
+	op.lister.OperatorsV1alpha1().RegisterClusterServiceVersionLister(metav1.NamespaceAll, csvLister)
+	if err := op.RegisterInformer(prunedCSVInformer); err != nil {
 		return nil, err
 	}
-
-	if err := csvInformer.Informer().AddIndexers(cache.Indexers{index.ProvidedAPIsIndexFuncKey: index.ProvidedAPIsIndexFunc}); err != nil {
-		return nil, err
-	}
-	csvIndexer := csvInformer.Informer().GetIndexer()
-	op.csvProvidedAPIsIndexer[metav1.NamespaceAll] = csvIndexer
 
 	// TODO: Add namespace resolve sync
 
@@ -310,13 +336,37 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 	op.lister.CoreV1().RegisterServiceLister(metav1.NamespaceAll, serviceInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, serviceInformer.Informer())
 
-	// Wire Pods
-	podInformer := k8sInformerFactory.Core().V1().Pods()
-	op.lister.CoreV1().RegisterPodLister(metav1.NamespaceAll, podInformer.Lister())
-	sharedIndexInformers = append(sharedIndexInformers, podInformer.Informer())
+	// Wire Pods for CatalogSource
+	catsrcReq, err := labels.NewRequirement(reconciler.CatalogSourceLabelKey, selection.Exists, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	csPodLabels := labels.NewSelector()
+	csPodLabels = csPodLabels.Add(*catsrcReq)
+	csPodInformer := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), resyncPeriod(), informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+		options.LabelSelector = csPodLabels.String()
+	})).Core().V1().Pods()
+	op.lister.CoreV1().RegisterPodLister(metav1.NamespaceAll, csPodInformer.Lister())
+	sharedIndexInformers = append(sharedIndexInformers, csPodInformer.Informer())
+
+	// Wire Pods for BundleUnpack job
+	buReq, err := labels.NewRequirement(bundle.BundleUnpackPodLabel, selection.Exists, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	buPodLabels := labels.NewSelector()
+	buPodLabels = buPodLabels.Add(*buReq)
+	buPodInformer := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), resyncPeriod(), informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+		options.LabelSelector = buPodLabels.String()
+	})).Core().V1().Pods()
+	sharedIndexInformers = append(sharedIndexInformers, buPodInformer.Informer())
 
 	// Wire ConfigMaps
-	configMapInformer := k8sInformerFactory.Core().V1().ConfigMaps()
+	configMapInformer := informers.NewSharedInformerFactoryWithOptions(op.opClient.KubernetesInterface(), resyncPeriod(), informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+		options.LabelSelector = install.OLMManagedLabelKey
+	})).Core().V1().ConfigMaps()
 	op.lister.CoreV1().RegisterConfigMapLister(metav1.NamespaceAll, configMapInformer.Lister())
 	sharedIndexInformers = append(sharedIndexInformers, configMapInformer.Informer())
 
@@ -344,14 +394,15 @@ func NewOperator(ctx context.Context, kubeconfigPath string, clock utilclock.Clo
 
 	// Setup the BundleUnpacker
 	op.bundleUnpacker, err = bundle.NewConfigmapUnpacker(
+		bundle.WithLogger(op.logger),
 		bundle.WithClient(op.opClient.KubernetesInterface()),
 		bundle.WithCatalogSourceLister(catsrcInformer.Lister()),
 		bundle.WithConfigMapLister(configMapInformer.Lister()),
 		bundle.WithJobLister(jobInformer.Lister()),
-		bundle.WithPodLister(podInformer.Lister()),
+		bundle.WithPodLister(buPodInformer.Lister()),
 		bundle.WithRoleLister(roleInformer.Lister()),
 		bundle.WithRoleBindingLister(roleBindingInformer.Lister()),
-		bundle.WithOPMImage(configmapRegistryImage),
+		bundle.WithOPMImage(opmImage),
 		bundle.WithUtilImage(utilImage),
 		bundle.WithNow(op.now),
 		bundle.WithUnpackTimeout(op.bundleUnpackTimeout),
@@ -569,15 +620,31 @@ func (o *Operator) syncConfigMap(logger *logrus.Entry, in *v1alpha1.CatalogSourc
 
 	logger.Debug("checking catsrc configmap state")
 
+	var updateLabel bool
 	// Get the catalog source's config map
 	configMap, err := o.lister.CoreV1().ConfigMapLister().ConfigMaps(in.GetNamespace()).Get(in.Spec.ConfigMap)
+	// Attempt to look up the CM via api call if there is a cache miss
+	if k8serrors.IsNotFound(err) {
+		configMap, err = o.opClient.KubernetesInterface().CoreV1().ConfigMaps(in.GetNamespace()).Get(context.TODO(), in.Spec.ConfigMap, metav1.GetOptions{})
+		// Found cm in the cluster, add managed label to configmap
+		if err == nil {
+			labels := configMap.GetLabels()
+			if labels == nil {
+				labels = make(map[string]string)
+			}
+
+			labels[install.OLMManagedLabelKey] = "false"
+			configMap.SetLabels(labels)
+			updateLabel = true
+		}
+	}
 	if err != nil {
 		syncError = fmt.Errorf("failed to get catalog config map %s: %s", in.Spec.ConfigMap, err)
 		out.SetError(v1alpha1.CatalogSourceConfigMapError, syncError)
 		return
 	}
 
-	if wasOwned := ownerutil.EnsureOwner(configMap, in); !wasOwned {
+	if wasOwned := ownerutil.EnsureOwner(configMap, in); !wasOwned || updateLabel {
 		configMap, err = o.opClient.KubernetesInterface().CoreV1().ConfigMaps(configMap.GetNamespace()).Update(context.TODO(), configMap, metav1.UpdateOptions{})
 		if err != nil {
 			syncError = fmt.Errorf("unable to write owner onto catalog source configmap - %v", err)
@@ -917,9 +984,22 @@ func (o *Operator) syncResolvingNamespace(obj interface{}) error {
 		// not-satisfiable error
 		if _, ok := err.(solver.NotSatisfiable); ok {
 			logger.WithError(err).Debug("resolution failed")
+			updateErr := o.setSubsCond(subs, v1alpha1.SubscriptionResolutionFailed, "ConstraintsNotSatisfiable", err.Error(), true)
+			if updateErr != nil {
+				logger.WithError(updateErr).Debug("failed to update subs conditions")
+			}
 			return nil
 		}
+		updateErr := o.setSubsCond(subs, v1alpha1.SubscriptionResolutionFailed, "ErrorPreventedResolution", err.Error(), true)
+		if updateErr != nil {
+			logger.WithError(updateErr).Debug("failed to update subs conditions")
+		}
 		return err
+	} else {
+		updateErr := o.setSubsCond(subs, v1alpha1.SubscriptionResolutionFailed, "", "", false)
+		if updateErr != nil {
+			logger.WithError(updateErr).Debug("failed to update subs conditions")
+		}
 	}
 
 	// create installplan if anything updated
@@ -1195,6 +1275,55 @@ func (o *Operator) createInstallPlan(namespace string, gen int, subs []*v1alpha1
 	}
 
 	return reference.GetReference(res)
+}
+
+func (o *Operator) setSubsCond(subs []*v1alpha1.Subscription, condType v1alpha1.SubscriptionConditionType, reason, message string, setTrue bool) error {
+	var (
+		errs        []error
+		mu          sync.Mutex
+		wg          sync.WaitGroup
+		getOpts     = metav1.GetOptions{}
+		updateOpts  = metav1.UpdateOptions{}
+		lastUpdated = o.now()
+	)
+	for _, sub := range subs {
+		sub.Status.LastUpdated = lastUpdated
+		cond := sub.Status.GetCondition(condType)
+		cond.Reason = reason
+		cond.Message = message
+		if setTrue {
+			cond.Status = corev1.ConditionTrue
+		} else {
+			cond.Status = corev1.ConditionFalse
+		}
+		sub.Status.SetCondition(cond)
+
+		wg.Add(1)
+		go func(s v1alpha1.Subscription) {
+			defer wg.Done()
+
+			update := func() error {
+				// Update the status of the latest revision
+				latest, err := o.client.OperatorsV1alpha1().Subscriptions(s.GetNamespace()).Get(context.TODO(), s.GetName(), getOpts)
+				if err != nil {
+					return err
+				}
+
+				latest.Status = s.Status
+				_, err = o.client.OperatorsV1alpha1().Subscriptions(s.Namespace).UpdateStatus(context.TODO(), latest, updateOpts)
+
+				return err
+			}
+			if err := retry.RetryOnConflict(retry.DefaultRetry, update); err != nil {
+				mu.Lock()
+				defer mu.Unlock()
+				errs = append(errs, err)
+			}
+		}(*sub)
+	}
+	wg.Wait()
+
+	return utilerrors.NewAggregate(errs)
 }
 
 type UnpackedBundleReference struct {
@@ -1782,6 +1911,8 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 	ensurer := newStepEnsurer(kubeclient, crclient, dynamicClient)
 	r := newManifestResolver(plan.GetNamespace(), o.lister.CoreV1().ConfigMapLister(), o.logger)
 
+	discoveryQuerier := newDiscoveryQuerier(o.opClient.KubernetesInterface().Discovery())
+
 	// CRDs should be installed via the default OLM (cluster-admin) client and not the scoped client specified by the AttenuatedServiceAccount
 	// the StepBuilder is currently only implemented for CRD types
 	// TODO give the StepBuilder both OLM and scoped clients when it supports new scoped types
@@ -2181,6 +2312,14 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 			}
 			return nil
 		}(i, step); err != nil {
+			if k8serrors.IsNotFound(err) {
+				// Check for APIVersions present in the installplan steps that are not available on the server.
+				// The check is made via discovery per step in the plan. Transient communication failures to the api-server are handled by the plan retry logic.
+				notFoundErr := discoveryQuerier.WithStepResource(step.Resource).QueryForGVK()
+				if notFoundErr != nil {
+					return notFoundErr
+				}
+			}
 			return err
 		}
 	}

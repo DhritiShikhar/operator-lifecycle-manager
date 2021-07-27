@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blang/semver/v4"
+	"k8s.io/apimachinery/pkg/util/errors"
+
 	"github.com/sirupsen/logrus"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
@@ -78,6 +79,19 @@ type NamespacedOperatorCache struct {
 	namespaces []string
 	existing   *registry.CatalogKey
 	snapshots  map[registry.CatalogKey]*CatalogSnapshot
+}
+
+func (c *NamespacedOperatorCache) Error() error {
+	var errs []error
+	for key, snapshot := range c.snapshots {
+		snapshot.m.Lock()
+		err := snapshot.err
+		snapshot.m.Unlock()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error using catalog %s (in namespace %s): %w", key.Name, key.Namespace, err))
+		}
+	}
+	return errors.NewAggregate(errs)
 }
 
 func (c *OperatorCache) Expire(catalog registry.CatalogKey) {
@@ -184,6 +198,12 @@ func (c *OperatorCache) Namespaced(namespaces ...string) MultiCatalogOperatorFin
 
 func (c *OperatorCache) populate(ctx context.Context, snapshot *CatalogSnapshot, registry client.Interface) {
 	defer snapshot.m.Unlock()
+	defer func() {
+		// Don't cache an errorred snapshot.
+		if snapshot.err != nil {
+			snapshot.expiry = time.Time{}
+		}
+	}()
 
 	c.sem <- struct{}{}
 	defer func() { <-c.sem }()
@@ -196,6 +216,7 @@ func (c *OperatorCache) populate(ctx context.Context, snapshot *CatalogSnapshot,
 	it, err := registry.ListBundles(ctx)
 	if err != nil {
 		snapshot.logger.Errorf("failed to list bundles: %s", err.Error())
+		snapshot.err = err
 		return
 	}
 	c.logger.WithField("catalog", snapshot.key.String()).Debug("updating cache")
@@ -224,6 +245,7 @@ func (c *OperatorCache) populate(ctx context.Context, snapshot *CatalogSnapshot,
 	}
 	if err := it.Error(); err != nil {
 		snapshot.logger.Warnf("error encountered while listing bundles: %s", err.Error())
+		snapshot.err = err
 	}
 	snapshot.operators = operators
 }
@@ -294,6 +316,7 @@ type CatalogSnapshot struct {
 	m         sync.RWMutex
 	pop       context.CancelFunc
 	priority  catalogSourcePriority
+	err       error
 }
 
 func (s *CatalogSnapshot) Cancel() {
@@ -387,16 +410,6 @@ func (s SortableSnapshots) Swap(i, j int) {
 	s.snapshots[i], s.snapshots[j] = s.snapshots[j], s.snapshots[i]
 }
 
-type OperatorPredicateFunc func(*Operator) bool
-
-func (opf OperatorPredicateFunc) Test(o *Operator) bool {
-	return opf(o)
-}
-
-type OperatorPredicate interface {
-	Test(*Operator) bool
-}
-
 func (s *CatalogSnapshot) Find(p ...OperatorPredicate) []*Operator {
 	s.m.RLock()
 	defer s.m.RUnlock()
@@ -411,6 +424,7 @@ type MultiCatalogOperatorFinder interface {
 	Catalog(registry.CatalogKey) OperatorFinder
 	FindPreferred(*registry.CatalogKey, ...OperatorPredicate) []*Operator
 	WithExistingOperators(*CatalogSnapshot) MultiCatalogOperatorFinder
+	Error() error
 	OperatorFinder
 }
 
@@ -418,155 +432,6 @@ type EmptyOperatorFinder struct{}
 
 func (f EmptyOperatorFinder) Find(...OperatorPredicate) []*Operator {
 	return nil
-}
-
-func WithCSVName(name string) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		return o.name == name
-	})
-}
-
-func WithChannel(channel string) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		// all operators match the empty channel
-		if channel == "" {
-			return true
-		}
-		if o.bundle == nil {
-			return false
-		}
-		return o.bundle.ChannelName == channel
-	})
-}
-
-func WithPackage(pkg string) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		for _, p := range o.Properties() {
-			if p.Type != opregistry.PackageType {
-				continue
-			}
-			var prop opregistry.PackageProperty
-			err := json.Unmarshal([]byte(p.Value), &prop)
-			if err != nil {
-				continue
-			}
-			if prop.PackageName == pkg {
-				return true
-			}
-		}
-		return o.Package() == pkg
-	})
-}
-
-func WithVersionInRange(r semver.Range) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		for _, p := range o.Properties() {
-			if p.Type != opregistry.PackageType {
-				continue
-			}
-			var prop opregistry.PackageProperty
-			err := json.Unmarshal([]byte(p.Value), &prop)
-			if err != nil {
-				continue
-			}
-			ver, err := semver.Parse(prop.Version)
-			if err != nil {
-				continue
-			}
-			if r(ver) {
-				return true
-			}
-		}
-		return o.version != nil && r(*o.version)
-	})
-}
-
-func WithLabel(label string) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		for _, p := range o.Properties() {
-			if p.Type != opregistry.LabelType {
-				continue
-			}
-			var prop opregistry.LabelProperty
-			err := json.Unmarshal([]byte(p.Value), &prop)
-			if err != nil {
-				continue
-			}
-			if prop.Label == label {
-				return true
-			}
-		}
-		return false
-	})
-}
-
-func WithCatalog(key registry.CatalogKey) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		return key.Equal(o.SourceInfo().Catalog)
-	})
-}
-
-func ProvidingAPI(api opregistry.APIKey) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		for _, p := range o.Properties() {
-			if p.Type != opregistry.GVKType {
-				continue
-			}
-			var prop opregistry.GVKProperty
-			err := json.Unmarshal([]byte(p.Value), &prop)
-			if err != nil {
-				continue
-			}
-			if prop.Kind == api.Kind && prop.Version == api.Version && prop.Group == api.Group {
-				return true
-			}
-		}
-		return false
-	})
-}
-
-func SkipRangeIncludes(version semver.Version) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		// TODO: lift range parsing to OperatorSurface
-		semverRange, err := semver.ParseRange(o.bundle.SkipRange)
-		return err == nil && semverRange(version)
-	})
-}
-
-func Replaces(name string) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		if o.Replaces() == name {
-			return true
-		}
-		for _, s := range o.bundle.Skips {
-			if s == name {
-				return true
-			}
-		}
-		return false
-	})
-}
-
-func And(p ...OperatorPredicate) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		for _, l := range p {
-			if l.Test(o) == false {
-				return false
-			}
-		}
-		return true
-	})
-}
-
-func Or(p ...OperatorPredicate) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		for _, l := range p {
-			if l.Test(o) == true {
-				return true
-			}
-		}
-		return false
-	})
 }
 
 func AtLeast(n int, operators []*Operator) ([]*Operator, error) {
@@ -595,26 +460,4 @@ func Filter(operators []*Operator, p ...OperatorPredicate) []*Operator {
 
 func Matches(o *Operator, p ...OperatorPredicate) bool {
 	return And(p...).Test(o)
-}
-
-func True() OperatorPredicate {
-	return OperatorPredicateFunc(func(*Operator) bool {
-		return true
-	})
-}
-
-func False() OperatorPredicate {
-	return OperatorPredicateFunc(func(*Operator) bool {
-		return false
-	})
-}
-
-func CountingPredicate(p OperatorPredicate, n *int) OperatorPredicate {
-	return OperatorPredicateFunc(func(o *Operator) bool {
-		if p.Test(o) {
-			*n++
-			return true
-		}
-		return false
-	})
 }
